@@ -1,0 +1,221 @@
+(() => {
+  const model = geofs.aircraft.instance.object3d.model._model;
+  const scene = geofs.api.viewer.scene;
+  const rr = model._rendererResources;
+  const oldSources = rr?.sourceShaders;
+
+  if (!oldSources || !model._sourcePrograms) {
+    console.log("描画ソースが見つかりません");
+    return;
+  }
+
+  if (window.__geofsReflectPatch) {
+    console.log("既存テストがあります。先に __geofsReflectPatch.restore() を実行してください");
+    return;
+  }
+
+  const textureSeed = Object.values(rr.textures || {})
+    .find(t => t && typeof t.copyFrom === "function");
+
+  if (!textureSeed) {
+    console.log("テクスチャ生成元が見つかりません");
+    return;
+  }
+
+  let reflectionUrl;
+
+  try {
+    reflectionUrl = new URL(
+      "../../../../shaders/reflection.jpg",
+      new URL(model._resource.url, location.href)
+    ).href;
+  } catch (e) {
+    console.log("反射マップURLを作成できません", e);
+    return;
+  }
+
+  console.log("反射マップ:", reflectionUrl);
+
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+
+  img.onerror = () => {
+    console.log("反射マップを読み込めませんでした。機体の描画は変更していません。");
+  };
+
+  img.onload = () => {
+    let texture;
+
+    try {
+      const C = window.Cesium;
+      let sampler;
+
+      try {
+        sampler = new C.Sampler({
+          wrapS: C.TextureWrap.REPEAT,
+          wrapT: C.TextureWrap.CLAMP_TO_EDGE,
+          minificationFilter: C.TextureMinificationFilter.LINEAR,
+          magnificationFilter: C.TextureMagnificationFilter.LINEAR
+        });
+      } catch (_) {}
+
+      texture = new textureSeed.constructor({
+        context: scene.context,
+        source: img,
+        flipY: true,
+        ...(sampler ? { sampler } : {})
+      });
+    } catch (e) {
+      console.log("反射テクスチャの作成に失敗:", e);
+      return;
+    }
+
+    const sources = { ...oldSources };
+    const changed = [];
+
+    const effect = `
+      vec3 pr_view = normalize(v);
+      vec3 pr_normal = normalize(n);
+      vec3 pr_dir = normalize(
+        czm_inverseViewRotation * reflect(-pr_view, pr_normal)
+      );
+
+      vec2 pr_uv = vec2(
+        atan(pr_dir.z, pr_dir.x) / 6.28318530718 + 0.5,
+        0.5 - asin(clamp(pr_dir.y, -1.0, 1.0)) / 3.14159265359
+      );
+
+      vec3 pr_env = pow(
+        texture2D(u_premiumReflectionMap, pr_uv).rgb,
+        vec3(2.2)
+      );
+
+      float pr_fresnel = pow(
+        1.0 - max(dot(pr_normal, pr_view), 0.0),
+        5.0
+      );
+
+      float pr_metal = clamp(metalness, 0.0, 1.0);
+      float pr_rough = clamp(roughness, 0.04, 1.0);
+
+      float pr_strength = clamp(
+        (0.22 + 0.45 * pr_metal + 0.25 * pr_fresnel)
+        * (1.0 - 0.70 * pr_rough),
+        0.0,
+        0.85
+      );
+
+      color = mix(color, pr_env, pr_strength);
+    `;
+
+    for (const p of Object.values(model._sourcePrograms)) {
+      const id = p.fragmentShader;
+      const src = sources[id];
+
+      if (typeof src !== "string" ||
+          !src.includes("v_positionEC") ||
+          !/\bfloat\s+metalness\b/.test(src) ||
+          !/\bfloat\s+roughness\b/.test(src) ||
+          !src.includes("LINEARtoSRGB(color)")) {
+        continue;
+      }
+
+      if (src.includes("u_premiumReflectionMap")) continue;
+
+      let next = src.replace(
+        /precision\s+highp\s+float\s*;/,
+        s => s + "\nuniform sampler2D u_premiumReflectionMap;"
+      );
+
+      if (next === src) continue;
+
+      const before = next;
+
+      next = next.replace(
+        /color\s*=\s*LINEARtoSRGB\(color\)\s*;/,
+        effect + "\n    color = LINEARtoSRGB(color);"
+      );
+
+      if (next === before) continue;
+
+      sources[id] = next;
+      changed.push(id);
+    }
+
+    if (!changed.length) {
+      texture.destroy();
+      console.log("対応するPBRフラグメントシェーダーが見つかりません。変更していません。");
+      return;
+    }
+
+    const maps = [];
+
+    for (const node of model._nodeCommands || []) {
+      for (const key of [
+        "command",
+        "command2D",
+        "translucentCommand",
+        "translucentCommand2D"
+      ]) {
+        const command = node?.[key];
+        const map = command?.uniformMap || command?._uniformMap;
+
+        if (!map || typeof map !== "object") continue;
+
+        maps.push({
+          map,
+          had: Object.prototype.hasOwnProperty.call(
+            map, "u_premiumReflectionMap"
+          ),
+          old: map.u_premiumReflectionMap
+        });
+
+        map.u_premiumReflectionMap = () => texture;
+      }
+    }
+
+    if (!maps.length) {
+      texture.destroy();
+      console.log("描画uniformMapが見つかりません。変更していません。");
+      return;
+    }
+
+    rr.sourceShaders = sources;
+    model._shouldRegenerateShaders = true;
+
+    window.__geofsReflectPatch = {
+      restore() {
+        rr.sourceShaders = oldSources;
+
+        for (const entry of maps) {
+          if (entry.had) {
+            entry.map.u_premiumReflectionMap = entry.old;
+          } else {
+            delete entry.map.u_premiumReflectionMap;
+          }
+        }
+
+        model._shouldRegenerateShaders = true;
+        scene.requestRender?.();
+
+        setTimeout(() => {
+          try {
+            if (!texture.isDestroyed?.()) texture.destroy();
+          } catch (_) {}
+        }, 1500);
+
+        delete window.__geofsReflectPatch;
+        console.log("元のシェーダーに戻すよう設定しました");
+      }
+    };
+
+    scene.requestRender?.();
+
+    console.log("反射シェーダー変更:", changed);
+    console.log("描画uniformMap追加:", maps.length);
+    console.log("復元: __geofsReflectPatch.restore()");
+    console.log("再描画後に機体の反射を確認してください");
+  };
+
+  img.src = reflectionUrl;
+})();
