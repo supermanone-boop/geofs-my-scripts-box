@@ -99,11 +99,11 @@
       float pr_rough = clamp(roughness, 0.04, 1.0);
 
       float pr_strength = clamp(
-        (0.22 + 0.45 * pr_metal + 0.25 * pr_fresnel)
-        * (1.0 - 0.70 * pr_rough),
-        0.0,
-        0.85
-      );
+  (0.06 + 0.12 * pr_metal + 0.06 * pr_fresnel)
+  * (1.0 - 0.70 * pr_rough),
+  0.0,
+  0.22
+);
 
       color = mix(color, pr_env, pr_strength);
     `;
