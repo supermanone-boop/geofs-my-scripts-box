@@ -1,0 +1,1 @@
+javascript:(async()=>{try{const r=await fetch('https://raw.githubusercontent.com/tylerbmusic/GeoFS-GPWS-Callouts/refs/heads/main/userscript.js');if(!r.ok)return;let s=await r.text();const i=s.indexOf('// ==/UserScript==');if(i!==-1)s=s.slice(i+'// ==/UserScript=='.length);(0,eval)(s)}catch(e){console.error('GPWS:',e)}})();
